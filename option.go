@@ -11,6 +11,14 @@ import (
 // Option user's option
 type Option func(s *Server)
 
+// WithInterceptor is an interface that defines methods for intercepting
+// SOCKS5 requests and responses.
+func WithInterceptor(interceptor Interceptor) Option {
+	return func(s *Server) {
+		s.interceptor = &interceptor
+	}
+}
+
 // WithBufferPool can be provided to implement custom buffer pool
 // By default, buffer pool use size is 32k
 func WithBufferPool(bufferPool bufferpool.BufPool) Option {

@@ -18,6 +18,30 @@ type GPool interface {
 	Submit(f func()) error
 }
 
+// Interceptor is an interface that defines methods for intercepting
+// SOCKS5 requests and responses.
+type Interceptor interface {
+	// OnRequest is called when a SOCKS5 request is intercepted.
+	// The request parameter contains information about the intercepted request.
+	// The src parameter is the connection that the request was received on.
+	// The dst parameter is the connection that the request was sent on.
+	// The method should return an error if the request should be rejected.
+	// The method should return a non-nil byte slice if the request should be
+	// modified. The byte slice will be sent to the client as the response.
+	OnRequest(ctx context.Context, request []byte, src net.Conn, dst net.Conn) ([]byte, error)
+
+	// OnResponse is called when a SOCKS5 response is intercepted.
+	// The response parameter contains information about the intercepted response.
+	// The src parameter is the connection that the response was sent on.
+	// The dst parameter is the connection that the response was received on.
+	// The method should return an error if the response should be rejected.
+	// The method should return a non-nil byte slice if the response should be
+	// modified. The byte slice will be sent to the client as the response.
+	OnResponse(ctx context.Context, response []byte, src net.Conn, dst net.Conn) ([]byte, error)
+
+	OnRequestEnd(ctx context.Context, src net.Conn, dst net.Conn) error
+}
+
 // Server is responsible for accepting connections and handling
 // the details of the SOCKS5 protocol
 type Server struct {
@@ -48,6 +72,8 @@ type Server struct {
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// buffer pool
 	bufferPool bufferpool.BufPool
+	// interceptor
+	interceptor *Interceptor
 	// goroutine pool
 	gPool GPool
 	// user's handle
@@ -136,7 +162,7 @@ func (sf *Server) ServeConn(conn net.Conn) error {
 	}
 
 	// The client request detail
-	request, err := ParseRequest(bufConn)
+	request, err := ParseRequest(conn)
 	if err != nil {
 		if errors.Is(err, statute.ErrUnrecognizedAddrType) {
 			if err := SendReply(conn, statute.RepAddrTypeNotSupported, nil); err != nil {

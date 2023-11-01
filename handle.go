@@ -1,7 +1,9 @@
 package socks5
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -105,8 +107,12 @@ func (sf *Server) handleRequest(write io.Writer, req *Request) error {
 	}
 }
 
-// handleConnect is used to handle a connect command
 func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *Request) error {
+	srcWriter, ok := writer.(net.Conn)
+	if !ok {
+		return fmt.Errorf("writer is not a net.Conn")
+	}
+
 	// Attempt to connect
 	dial := sf.dial
 	if dial == nil {
@@ -137,8 +143,31 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 
 	// Start proxying
 	errCh := make(chan error, 2)
-	sf.goFunc(func() { errCh <- sf.Proxy(target, request.Reader) })
-	sf.goFunc(func() { errCh <- sf.Proxy(writer, target) })
+
+	readyConn, err := sf.getReadyConn(srcWriter)
+	if err != nil {
+		return err
+	}
+
+	if readyConn.isTlsConn {
+		// Upgrade destination to TLS
+		tlsTarget, err := sf.upgradeDestinationToTls(target)
+		if err != nil {
+			return err
+		}
+
+		go func() {
+			sf.Proxy(ctx, readyConn, tlsTarget, false)
+		}()
+
+		go func() {
+			sf.Proxy(ctx, tlsTarget, readyConn, true)
+		}()
+	} else {
+		sf.goFunc(func() { errCh <- sf.Proxy(ctx, readyConn, target, true) })
+		sf.goFunc(func() { errCh <- sf.Proxy(ctx, target, readyConn, false) })
+	}
+
 	// Wait
 	for i := 0; i < 2; i++ {
 		e := <-errCh
@@ -148,6 +177,71 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 		}
 	}
 	return nil
+}
+
+func (sf *Server) getReadyConn(srcConn net.Conn) (*bufferedConn, error) {
+	buf := sf.bufferPool.Get()
+	defer sf.bufferPool.Put(buf)
+
+	n, err := srcConn.Read(buf[:cap(buf)])
+	if err != nil {
+		return nil, err
+	}
+
+	initialBytes := buf[:n]
+
+	if len(initialBytes) > 0 && initialBytes[0] == 0x16 {
+		srcBuffConn := &bufferedConn{
+			Conn:           srcConn,
+			buffer:         initialBytes,
+			readFromBuffer: false,
+		}
+
+		// Load certificate and key
+		cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+		if err != nil {
+			return nil, fmt.Errorf("failed to load certificate and key: %w", err)
+		}
+
+		// Create TLS server
+		srcTlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
+		srcTls := tls.Server(srcBuffConn, srcTlsConfig)
+
+		err = srcTls.Handshake()
+		if err != nil {
+			return nil, err
+		}
+
+		srcTlsBufConn := &bufferedConn{
+			Conn:           srcTls,
+			buffer:         initialBytes,
+			readFromBuffer: true,
+			isTlsConn:      true,
+		}
+
+		return srcTlsBufConn, nil
+	}
+
+	return &bufferedConn{
+		Conn:   srcConn,
+		buffer: initialBytes,
+	}, nil
+}
+
+func (sf *Server) upgradeDestinationToTls(target net.Conn) (*tls.Conn, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	tlsTarget := tls.Client(target, tlsConfig)
+	err := tlsTarget.Handshake()
+	if err != nil {
+		return nil, err
+	}
+
+	return tlsTarget, nil
 }
 
 // handleBind is used to handle a connect command
@@ -323,18 +417,95 @@ func SendReply(w io.Writer, rep uint8, bindAddr net.Addr) error {
 	return err
 }
 
-type closeWriter interface {
-	CloseWrite() error
+type bufferedConn struct {
+	net.Conn
+	buffer         []byte
+	readFromBuffer bool
+	isTlsConn      bool
 }
 
-// Proxy is used to suffle data from src to destination, and sends errors
-// down a dedicated channel
-func (sf *Server) Proxy(dst io.Writer, src io.Reader) error {
-	buf := sf.bufferPool.Get()
-	defer sf.bufferPool.Put(buf)
-	_, err := io.CopyBuffer(dst, src, buf[:cap(buf)])
-	if tcpConn, ok := dst.(closeWriter); ok {
-		tcpConn.CloseWrite() //nolint: errcheck
+func (b *bufferedConn) Read(p []byte) (int, error) {
+	if !b.readFromBuffer {
+		n := copy(p, b.buffer)
+		b.readFromBuffer = true
+		return n, nil
 	}
-	return err
+	return b.Conn.Read(p)
+}
+
+// Proxy is used to shuffle data from src to destination, and sends errors
+// down a dedicated channel
+// func (sf *Server) ProxyRequest(context context.Context, io.Writer, src io.Reader) error {
+func (sf *Server) Proxy(context context.Context, dst io.Writer, src io.Reader, isRequest bool) error {
+	if sf.interceptor == nil {
+		buf := sf.bufferPool.Get()
+		defer sf.bufferPool.Put(buf)
+		// Copy data from source to destination
+		_, err := io.CopyBuffer(dst, src, buf[:cap(buf)])
+		if err != nil {
+			return err
+		}
+		return nil
+	} else {
+		var tempBuffer bytes.Buffer
+		var buf = make([]byte, 1024)
+
+		srcConn, ok := src.(net.Conn)
+		if !ok {
+			return errors.New("src is not a net.Conn")
+		}
+
+		dstConn, ok := dst.(net.Conn)
+		if !ok {
+			return errors.New("dst is not a net.Conn")
+		}
+
+		interceptor := *sf.interceptor
+
+		for {
+			n, err := src.Read(buf)
+			if err != nil && err != io.EOF {
+				break
+			}
+
+			if n > 0 {
+				tempBuffer.Write(buf[:n])
+			}
+
+			if n < len(buf) && tempBuffer.Len() > 0 {
+				var dat bytes.Buffer
+				if isRequest {
+					data, err := interceptor.OnRequest(context, tempBuffer.Bytes(), srcConn, dstConn)
+					if err != nil {
+						return err
+					}
+					dat = *bytes.NewBuffer(data)
+				} else {
+					data, err := interceptor.OnResponse(context, tempBuffer.Bytes(), srcConn, dstConn)
+					if err != nil {
+						return err
+					}
+					dat = *bytes.NewBuffer(data)
+				}
+
+				_, err := io.CopyBuffer(dst, &dat, nil)
+				if err != nil {
+					return err
+				}
+
+				tempBuffer.Reset()
+				buf = make([]byte, 1024)
+			}
+
+			if err == io.EOF {
+				break
+			}
+		}
+
+		if isRequest {
+			interceptor.OnRequestEnd(context, srcConn, dstConn)
+		}
+
+		return nil
+	}
 }
