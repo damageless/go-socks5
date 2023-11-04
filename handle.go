@@ -260,6 +260,7 @@ func generateDomainCert(domain string, caCert *x509.Certificate, caPrivateKey in
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		DNSNames: []string{domain},
 	}
 
 	// Create a new private key for the certificate
@@ -284,7 +285,6 @@ func generateDomainCert(domain string, caCert *x509.Certificate, caPrivateKey in
 
 	return certPEM, privPEM, nil
 }
-
 
 func (sf *Server) createDynamicCertificateForRequest(domain string) (tls.Certificate, error) {
 	// Read the CA certificate and key from PEM files
