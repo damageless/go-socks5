@@ -10,6 +10,14 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"crypto/rsa"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"time"
+	"os"
 
 	"github.com/things-go/go-socks5/statute"
 )
@@ -197,18 +205,27 @@ func (sf *Server) getReadyConn(srcConn net.Conn) (*bufferedConn, error) {
 			readFromBuffer: false,
 		}
 
-		// Load certificate and key
-		cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
-		if err != nil {
-			return nil, fmt.Errorf("failed to load certificate and key: %w", err)
+		var sni string
+		var cert tls.Certificate
+		var err error
+
+		// Create a custom TLS config with GetConfigForClient to extract SNI
+		srcTlsConfig := &tls.Config{
+			GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+				sni = info.ServerName // this is the domain name from SNI
+				cert, err = sf.createDynamicCertificateForRequest(sni)
+				if err != nil {
+					return nil, err
+				}
+				return &tls.Config{
+					Certificates: []tls.Certificate{cert},
+				}, nil
+			},
 		}
 
-		// Create TLS server
-		srcTlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-		}
 		srcTls := tls.Server(srcBuffConn, srcTlsConfig)
 
+		// Perform a handshake to trigger GetConfigForClient
 		err = srcTls.Handshake()
 		if err != nil {
 			return nil, err
@@ -228,6 +245,91 @@ func (sf *Server) getReadyConn(srcConn net.Conn) (*bufferedConn, error) {
 		Conn:   srcConn,
 		buffer: initialBytes,
 	}, nil
+}
+
+func generateDomainCert(domain string, caCert *x509.Certificate, caPrivateKey interface{}) ([]byte, []byte, error) {
+	// Create the template for the new certificate
+	certTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: domain,
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour), // 1 year
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	// Create a new private key for the certificate
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create the certificate signed by the CA
+	certBytes, err := x509.CreateCertificate(rand.Reader, &certTemplate, caCert, &privKey.PublicKey, caPrivateKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Encode the certificate and private key to PEM format
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
+	privBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
+
+	return certPEM, privPEM, nil
+}
+
+
+func (sf *Server) createDynamicCertificateForRequest(domain string) (tls.Certificate, error) {
+	// Read the CA certificate and key from PEM files
+	caCertPEM, err := os.ReadFile("cert.pem")
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	caKeyPEM, err := os.ReadFile("key.pem")
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Decode the CA certificate
+	caCertBlock, _ := pem.Decode(caCertPEM)
+	if caCertBlock == nil {
+		return tls.Certificate{}, errors.New("failed to decode CA certificate PEM")
+	}
+	caCert, err := x509.ParseCertificate(caCertBlock.Bytes)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Decode the CA private key
+	caKeyBlock, _ := pem.Decode(caKeyPEM)
+	if caKeyBlock == nil {
+		return tls.Certificate{}, errors.New("failed to decode CA private key PEM")
+	}
+	caPrivateKey, err := x509.ParsePKCS8PrivateKey(caKeyBlock.Bytes)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Generate a certificate for the domain
+	certPEM, privPEM, err := generateDomainCert(domain, caCert, caPrivateKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Load the certificate and the key into tls.Certificate struct
+	cert, err := tls.X509KeyPair(certPEM, privPEM)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	return cert, nil
 }
 
 func (sf *Server) upgradeDestinationToTls(target net.Conn) (*tls.Conn, error) {

@@ -129,7 +129,6 @@ func (sf *Server) Serve(l net.Listener) error {
 		}
 		sf.goFunc(func() {
 			if err := sf.ServeConn(conn); err != nil {
-				sf.logger.Errorf("server: %v", err)
 			}
 		})
 	}
