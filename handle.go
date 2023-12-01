@@ -17,7 +17,6 @@ import (
 	"encoding/pem"
 	"math/big"
 	"time"
-	"os"
 
 	"github.com/things-go/go-socks5/statute"
 )
@@ -206,7 +205,7 @@ func (sf *Server) getReadyConn(srcConn net.Conn) (*bufferedConn, error) {
 		}
 
 		var sni string
-		var cert tls.Certificate
+		var cert *tls.Certificate
 		var err error
 
 		// Create a custom TLS config with GetConfigForClient to extract SNI
@@ -218,7 +217,7 @@ func (sf *Server) getReadyConn(srcConn net.Conn) (*bufferedConn, error) {
 					return nil, err
 				}
 				return &tls.Config{
-					Certificates: []tls.Certificate{cert},
+					Certificates: []tls.Certificate{*cert},
 				}, nil
 			},
 		}
@@ -286,50 +285,32 @@ func generateDomainCert(domain string, caCert *x509.Certificate, caPrivateKey in
 	return certPEM, privPEM, nil
 }
 
-func (sf *Server) createDynamicCertificateForRequest(domain string) (tls.Certificate, error) {
-	// Read the CA certificate and key from PEM files
-	caCertPEM, err := os.ReadFile("cert.pem")
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	caKeyPEM, err := os.ReadFile("key.pem")
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	// Decode the CA certificate
-	caCertBlock, _ := pem.Decode(caCertPEM)
-	if caCertBlock == nil {
-		return tls.Certificate{}, errors.New("failed to decode CA certificate PEM")
-	}
-	caCert, err := x509.ParseCertificate(caCertBlock.Bytes)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	// Decode the CA private key
-	caKeyBlock, _ := pem.Decode(caKeyPEM)
-	if caKeyBlock == nil {
-		return tls.Certificate{}, errors.New("failed to decode CA private key PEM")
-	}
-	caPrivateKey, err := x509.ParsePKCS8PrivateKey(caKeyBlock.Bytes)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
+func (sf *Server) createDynamicCertificateForRequest(domain string) (*tls.Certificate, error) {
 	// Generate a certificate for the domain
-	certPEM, privPEM, err := generateDomainCert(domain, caCert, caPrivateKey)
+	rootCert, err := x509.ParseCertificate(sf.TLSRootCertificate.Certificate[0])
 	if err != nil {
-		return tls.Certificate{}, err
+		fmt.Println("failed to parse certificate: " + err.Error())
+		return nil, err
+	}
+
+	caKeyBlock, _ := pem.Decode(sf.TLSPrivateKey)
+	if caKeyBlock == nil {
+		return nil, errors.New("failed to decode CA private key PEM")
+	}
+	caPrivateKey, err := x509.ParseECPrivateKey(caKeyBlock.Bytes)
+
+	certPEM, privPEM, err := generateDomainCert(domain, rootCert, caPrivateKey)
+	if err != nil {
+		return nil, err
 	}
 
 	// Load the certificate and the key into tls.Certificate struct
 	cert, err := tls.X509KeyPair(certPEM, privPEM)
 	if err != nil {
-		return tls.Certificate{}, err
+		return nil, err
 	}
 
-	return cert, nil
+	return &cert, nil
 }
 
 func (sf *Server) upgradeDestinationToTls(target net.Conn) (*tls.Conn, error) {

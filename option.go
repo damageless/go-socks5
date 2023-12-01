@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 
@@ -16,6 +17,18 @@ type Option func(s *Server)
 func WithInterceptor(interceptor Interceptor) Option {
 	return func(s *Server) {
 		s.interceptor = &interceptor
+	}
+}
+
+func WithRootCert(cert *tls.Certificate) Option {
+	return func(s *Server) {
+		s.TLSRootCertificate = cert
+	}
+}
+
+func WithPrivateKey(key []byte) Option {
+	return func(s *Server) {
+		s.TLSPrivateKey = key
 	}
 }
 

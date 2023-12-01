@@ -3,6 +3,7 @@ package socks5
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -80,6 +81,11 @@ type Server struct {
 	userConnectHandle   func(ctx context.Context, writer io.Writer, request *Request) error
 	userBindHandle      func(ctx context.Context, writer io.Writer, request *Request) error
 	userAssociateHandle func(ctx context.Context, writer io.Writer, request *Request) error
+
+	// TLS certificate to use for TLS-based connections
+	TLSRootCertificate *tls.Certificate
+	// Private key to use for TLS-based connections
+	TLSPrivateKey []byte
 }
 
 // NewServer creates a new Server
